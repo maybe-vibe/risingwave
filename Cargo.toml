@@ -69,6 +69,7 @@ members = [
     "src/utils/sync-point",
     "src/utils/variables",
     "src/utils/workspace-config",
+    "src/utils/avro-validator",
     "src/workspace-hack",
 ]
 exclude = [

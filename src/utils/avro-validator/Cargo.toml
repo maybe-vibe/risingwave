@@ -1,0 +1,9 @@
+[package]
+name = "risingwave_avro_validator"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+anyhow = "1"
+apache-avro = { workspace = true }
+risingwave_connector_codec = { workspace = true }
