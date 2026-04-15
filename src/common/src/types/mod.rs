@@ -112,9 +112,9 @@ pub const DEBEZIUM_UNAVAILABLE_VALUE: &str = "__debezium_unavailable_value";
 // Pre-built JSON value for Debezium unavailable value to avoid rebuilding it every time
 pub static DEBEZIUM_UNAVAILABLE_JSON: std::sync::LazyLock<JsonbVal> =
     std::sync::LazyLock::new(|| {
-        let mut builder = jsonbb::Builder::default();
-        builder.add_string(DEBEZIUM_UNAVAILABLE_VALUE);
-        JsonbVal(builder.finish())
+        let mut b = jsonbb::Builder::default();
+        b.add_string(DEBEZIUM_UNAVAILABLE_VALUE);
+        JsonbVal(b.finish())
     });
 
 /// The set of datatypes that are supported in RisingWave.
