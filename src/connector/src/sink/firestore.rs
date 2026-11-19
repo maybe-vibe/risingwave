@@ -27,6 +27,7 @@ use gcloud_sdk::google::firestore::v1::value::ValueType;
 use gcloud_sdk::google::firestore::v1::{
     ArrayValue, BatchWriteRequest, Document, MapValue, Value, Write, write,
 };
+use gcloud_sdk::tonic::codegen::http;
 use prost::Message as _;
 use risingwave_common::array::{Op, RowRef, StreamChunk};
 use risingwave_common::catalog::Schema;
@@ -152,37 +153,57 @@ impl FirestoreConfig {
         if let Some(ref host) = emulator_host {
             options.firebase_api_url = Some(format!("http://{host}"));
         }
-        let (scopes, token_source) = self.token_source(emulator_host.is_some());
-        FirestoreDb::with_options_token_source(options, scopes, token_source)
+        let auth = self.auth_headers(emulator_host.is_some()).await?;
+        FirestoreDb::with_options_auth(options, auth)
             .await
             .map_err(|e| {
                 SinkError::Firestore(anyhow!(e).context("failed to create Firestore client"))
             })
     }
 
-    fn token_source(&self, emulator: bool) -> (Vec<String>, gcloud_sdk::TokenSourceType) {
-        use gcloud_sdk::{ExternalJwtFunctionSource, GCP_DEFAULT_SCOPES, Token, TokenSourceType};
+    async fn auth_headers(&self, emulator: bool) -> Result<gcloud_sdk::GoogleAuthHeaders> {
+        use gcloud_sdk::google_cloud_auth::credentials::{
+            Credentials, external_account, impersonated, service_account, user_account,
+        };
+        use gcloud_sdk::{GCP_DEFAULT_SCOPES, GoogleAuthHeaders};
+
         if emulator {
             // Neither the data client nor the metadata client should fetch ADC or
             // forward configured cloud credentials to an emulator.
-            let source = ExternalJwtFunctionSource::new(|| async {
-                Ok(Token::new(
-                    "Bearer".to_owned(),
-                    "owner".to_owned().into(),
-                    (std::time::SystemTime::now() + Duration::from_secs(3600))
-                        .try_into()
-                        .expect("an hour from now is a valid timestamp"),
-                ))
-            });
-            (vec![], TokenSourceType::ExternalSource(Box::new(source)))
-        } else if let Some(ref cred) = self.credentials {
-            (
-                GCP_DEFAULT_SCOPES.clone(),
-                TokenSourceType::Json(cred.clone()),
-            )
-        } else {
-            (GCP_DEFAULT_SCOPES.clone(), TokenSourceType::Default)
+            return Ok(GoogleAuthHeaders::from(Credentials::from(
+                FirestoreEmulatorCredentials::default(),
+            )));
         }
+        let Some(ref cred) = self.credentials else {
+            return GoogleAuthHeaders::from_adc().await.map_err(|e| {
+                SinkError::Firestore(anyhow!(e).context("failed to load Firestore credentials"))
+            });
+        };
+        let json: JsonValue = serde_json::from_str(cred).map_err(|e| {
+            SinkError::Config(anyhow!(e).context("firestore.credentials is not valid JSON"))
+        })?;
+        let scopes = GCP_DEFAULT_SCOPES.clone();
+        let credentials = match json.get("type").and_then(JsonValue::as_str) {
+            Some("service_account") => service_account::Builder::new(json)
+                .with_access_specifier(service_account::AccessSpecifier::from_scopes(scopes))
+                .build(),
+            Some("authorized_user") => user_account::Builder::new(json).with_scopes(scopes).build(),
+            Some("external_account") => external_account::Builder::new(json)
+                .with_scopes(scopes)
+                .build(),
+            Some("impersonated_service_account") => {
+                impersonated::Builder::new(json).with_scopes(scopes).build()
+            }
+            other => {
+                return Err(SinkError::Config(anyhow!(
+                    "unsupported firestore.credentials type: {other:?}"
+                )));
+            }
+        }
+        .map_err(|e| {
+            SinkError::Config(anyhow!(e).context("failed to build Firestore credentials"))
+        })?;
+        Ok(GoogleAuthHeaders::from(credentials))
     }
 
     async fn validate_decimal_mode(&self, schema: &Schema, client: &FirestoreDb) -> Result<()> {
@@ -216,16 +237,25 @@ impl FirestoreConfig {
 
     async fn database_edition(&self, client: &FirestoreDb) -> Result<Option<i32>> {
         let options = client.get_options();
-        let (scopes, token_source) = self.token_source(options.firebase_api_url.is_some());
-        let admin = gcloud_sdk::GoogleApi::from_function_with_token_source(
+        let auth = self
+            .auth_headers(options.firebase_api_url.is_some())
+            .await?;
+        let middleware = gcloud_sdk::GoogleAuthMiddlewareLayer::new(
+            auth,
+            Some(client.get_database_path().to_owned()),
+        )
+        .map_err(|error| {
+            SinkError::Firestore(
+                anyhow!(error).context("failed to create Firestore metadata client"),
+            )
+        })?;
+        let admin = gcloud_sdk::GoogleApi::from_function_with_middleware(
             FirestoreAdminClient::new,
             options
                 .firebase_api_url
                 .as_deref()
                 .unwrap_or("https://firestore.googleapis.com"),
-            Some(client.get_database_path().to_owned()),
-            scopes,
-            token_source,
+            middleware,
         )
         .await
         .map_err(|error| {
@@ -672,6 +702,42 @@ fn split_write_batches(writes: Vec<Write>, max_count: usize) -> Vec<Vec<Write>> 
         batches.push(batch);
     }
     batches
+}
+
+/// Serves the Firestore emulator's conventional `Bearer owner` token.
+#[derive(Debug, Default)]
+struct FirestoreEmulatorCredentials {
+    entity_tag: gcloud_sdk::google_cloud_auth::credentials::EntityTag,
+}
+
+impl gcloud_sdk::google_cloud_auth::credentials::CredentialsProvider
+    for FirestoreEmulatorCredentials
+{
+    async fn headers(
+        &self,
+        extensions: http::Extensions,
+    ) -> std::result::Result<
+        gcloud_sdk::google_cloud_auth::credentials::CacheableResource<http::HeaderMap>,
+        gcloud_sdk::google_cloud_auth::errors::CredentialsError,
+    > {
+        use gcloud_sdk::google_cloud_auth::credentials::{CacheableResource, EntityTag};
+        if extensions.get::<EntityTag>() == Some(&self.entity_tag) {
+            return Ok(CacheableResource::NotModified);
+        }
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer owner"),
+        );
+        Ok(CacheableResource::New {
+            entity_tag: self.entity_tag.clone(),
+            data: headers,
+        })
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        None
+    }
 }
 
 // Firestore storage size differs from protobuf size. See:
